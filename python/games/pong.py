@@ -44,6 +44,7 @@ class Pong(Game):
         self._lock = threading.Lock()
         self._running = False
         self._tick_count = 0
+        self._last_n = -1
 
     def start(self):
         self._running = True
@@ -71,16 +72,32 @@ class Pong(Game):
         if moved:
             self.render()
             if self.role == "guest":
-                self.io.send({
-                    "game": self.name,
-                    "type": "paddle",
-                    "y": self.my_y,
-                    "bx": 255,
-                    "by": 255,
-                    "s1": 0,
-                    "s2": 0,
-                    "over": False,
-                })
+                self.io.send(self._guest_paddle_pkt())
+
+    def _guest_paddle_pkt(self) -> dict:
+        return {
+            "game": self.name,
+            "type": "paddle",
+            "y": self.my_y,
+            "bx": 255,
+            "by": 255,
+            "s1": 0,
+            "s2": 0,
+            "over": False,
+        }
+
+    def _host_pkt(self) -> dict:
+        return {
+            "game": self.name,
+            "type": "paddle",
+            "n": self._tick_count,
+            "y": self.my_y,
+            "bx": self.bx,
+            "by": self.by,
+            "s1": self.my_score,
+            "s2": self.opp_score,
+            "over": self.over,
+        }
 
     def handle_remote(self, msg: dict):
         if self.over or self.role == "local":
@@ -99,6 +116,12 @@ class Pong(Game):
                 gy = int(msg.get("y", 2))
                 self.opp_y = max(0, min(H - PADDLE_H, gy))
             elif self.role == "guest":
+                # Drop stale/reordered state (UDP can reorder; "n" is the host tick counter)
+                n = msg.get("n")
+                if n is not None:
+                    if n <= self._last_n:
+                        return
+                    self._last_n = n
                 # Host sent full authoritative state; mirror X so guest sees itself on col 0!
                 hy = int(msg.get("y", 2))
                 self.opp_y = max(0, min(H - PADDLE_H, hy))
@@ -117,6 +140,9 @@ class Pong(Game):
                     self.over = True
                     self.result = res
         self.render()
+        if self.role == "guest" and not self.over:
+            # Re-announce our paddle with every host state so a lost paddle packet self-heals
+            self.io.send(self._guest_paddle_pkt())
 
     def _reset_ball(self, serve_dir: int):
         self.bx = 6
@@ -202,22 +228,19 @@ class Pong(Game):
                     self.by = ny
 
                 if self.role == "host" and (sync_needed or self._tick_count % 2 == 0 or self.over):
-                    pkt = {
-                        "game": self.name,
-                        "type": "paddle",
-                        "y": self.my_y,
-                        "bx": self.bx,
-                        "by": self.by,
-                        "s1": self.my_score,
-                        "s2": self.opp_score,
-                        "over": self.over,
-                    }
+                    pkt = self._host_pkt()
                 else:
                     pkt = None
 
             if pkt is not None:
                 self.io.send(pkt)
             self.render()
+
+        # Game over: the final packet decides the guest's result, so repeat it (lossy link)
+        if self.role == "host" and self.over and self.result in ("win", "lose"):
+            for _ in range(4):
+                time.sleep(0.25)
+                self.io.send(self._host_pkt())
 
     def snapshot(self) -> str:
         if self.over:

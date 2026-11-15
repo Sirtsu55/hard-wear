@@ -14,6 +14,8 @@ Snapshot for the display: 9 board chars ('X', 'O', '.'), the cursor cell
 and a mark char (whose turn it is, or the winner).
 """
 
+import threading
+
 from .base import Game
 
 LINES = [
@@ -59,7 +61,7 @@ class TicTacToe(Game):
                 self.io.show("Cell taken")
                 return
             if not self.local:
-                self.io.send({"game": self.name, "type": "move", "cell": self.cursor})
+                self._send_move(self.cursor, sum(1 for c in self.board if c))
             self._after_move()
 
     def handle_remote(self, msg: dict):
@@ -74,9 +76,23 @@ class TicTacToe(Game):
         cell = msg.get("cell")
         if not isinstance(cell, int) or not 0 <= cell < 9:
             return
+        n = msg.get("n")  # move number (marks on board after the move); dedupes resends
+        if n is not None and n != sum(1 for c in self.board if c):
+            return
         if self.turn != self.theirs or not self._place(cell, self.theirs):
             return  # out-of-turn or illegal move: ignore
         self._after_move()
+
+    def _send_move(self, cell: int, n: int):
+        """Moves are one-shot messages on a lossy link: send now and repeat a few times.
+        The receiver ignores duplicates via the move number."""
+        self.io.send({"game": self.name, "type": "move", "cell": cell, "n": n})
+        for i in range(1, 5):
+            t = threading.Timer(0.35 * i, self.io.send, args=({
+                "game": self.name, "type": "move", "cell": cell, "n": n, "dup": True,
+            },))
+            t.daemon = True
+            t.start()
 
     # ---- rules -----------------------------------------------------------
     def _my_turn(self) -> bool:

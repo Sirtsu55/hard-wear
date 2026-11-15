@@ -96,6 +96,7 @@ class BlePeerManager:
         self._udp_last_rx = {}     # peer_id -> last time a UDP datagram arrived from it
         self._start_acked = False
         self._start_pending = False
+        self._last_noip_warn = 0.0
 
     @staticmethod
     def _ip_to_bytes(ip: str) -> list[int]:
@@ -122,7 +123,9 @@ class BlePeerManager:
         self._write_daemon({"cmd": "udp", "ip": ip, "data": json.dumps(obj, separators=(",", ":"))})
         return True
 
-    def _udp_alive(self, peer_id: int, within: float = 4.0) -> bool:
+    def _udp_alive(self, peer_id: int, within: float = 120.0) -> bool:
+        # Long window on purpose: once UDP works, never mix in slow BLE copies (stale BLE
+        # packets arriving late would roll game state back).
         return time.time() - self._udp_last_rx.get(peer_id, 0.0) <= within
 
     def start(self):
@@ -256,58 +259,15 @@ class BlePeerManager:
     def send_game_dict(self, msg: dict):
         if not self._active_peer_id:
             return
-        game_name = msg.get("game", "pong")
-        gcode = GAME_CODES.get(game_name, 2)
-        mtype = msg.get("type", "")
-
-        # Preferred path: Wi-Fi UDP (full-fidelity dict, low latency). Fall back to BLE only
-        # while no UDP traffic has been seen from the peer.
-        if self._udp_send(self._active_peer_id, {"t": "g", "from": self.node_id, "msg": msg}):
-            if self._udp_alive(self._active_peer_id):
-                return
-
-        if mtype == "quit":
-            self._send_adv(self._active_peer_id, OP_GAME_MSG, [gcode, MSG_QUIT], revert_after=2.0)
-        elif mtype == "move":
-            # Tic-Tac-Toe cell move
-            cell = int(msg.get("cell", 0)) & 0xFF
-            self._send_adv(self._active_peer_id, OP_GAME_MSG, [gcode, MSG_MOVE, cell], revert_after=2.5)
-        elif mtype == "paddle":
-            # Pong paddle + authoritative ball/score sync from host
-            py = int(msg.get("y", 0)) & 0xFF
-            bx = int(msg.get("bx", 255)) & 0xFF
-            by = int(msg.get("by", 255)) & 0xFF
-            s1 = int(msg.get("s1", 0)) & 0xFF
-            s2 = int(msg.get("s2", 0)) & 0xFF
-            over = 1 if msg.get("over") else 0
-            self._send_adv(
-                self._active_peer_id,
-                OP_GAME_MSG,
-                [gcode, MSG_STATE, py, bx, by, s1, s2, over],
-                revert_after=1.8,
-            )
-        elif mtype == "snake_turn":
-            # Guest sends steering direction to host
-            d = int(msg.get("dir", 0)) & 0xFF
-            self._send_adv(self._active_peer_id, OP_GAME_MSG, [gcode, MSG_MOVE, d], revert_after=1.5)
-        elif mtype == "snake_sync":
-            # Host broadcasts compact authoritative tick state
-            # args: [h1, h2, fpos, len1, len2, res]  (positions = y*13 + x, or 255)
-            self._send_adv(
-                self._active_peer_id,
-                OP_GAME_MSG,
-                [
-                    gcode,
-                    MSG_SYNC,
-                    msg.get("h1", 0),
-                    msg.get("h2", 0),
-                    msg.get("food", 0),
-                    msg.get("l1", 3),
-                    msg.get("l2", 3),
-                    msg.get("res", 0),
-                ],
-                revert_after=1.8,
-            )
+        # Game traffic is Wi-Fi/UDP only (BLE is for discovery, votes and the start handshake).
+        if not self._udp_send(self._active_peer_id, {"t": "g", "from": self.node_id, "msg": msg}):
+            now = time.time()
+            if now - self._last_noip_warn > 5.0:
+                self._last_noip_warn = now
+                print(
+                    f"[ble] no Wi-Fi IP known for 0x{self._active_peer_id:04X}: game message dropped",
+                    flush=True,
+                )
 
     # ---- Daemon socket loop ----------------------------------------------
     def _write_daemon(self, obj: dict):
@@ -470,38 +430,7 @@ class BlePeerManager:
             self._active_peer_id = src_id
             self.advertise_idle()
             self.on_start_match(src_id, peer_name, gname, "guest")
-        elif opcode == OP_GAME_MSG and len(args) >= 2:
-            gname = CODE_TO_GAME.get(args[0], "pong")
-            mkind = args[1]
-            if mkind == MSG_QUIT:
-                self.on_game_msg({"game": gname, "type": "quit"})
-            elif mkind == MSG_MOVE and len(args) >= 3:
-                if gname == "tictactoe":
-                    self.on_game_msg({"game": gname, "type": "move", "cell": args[2]})
-                elif gname == "snake":
-                    self.on_game_msg({"game": gname, "type": "snake_turn", "dir": args[2]})
-            elif mkind == MSG_STATE and len(args) >= 8:
-                self.on_game_msg({
-                    "game": gname,
-                    "type": "paddle",
-                    "y": args[2],
-                    "bx": args[3],
-                    "by": args[4],
-                    "s1": args[5],
-                    "s2": args[6],
-                    "over": bool(args[7]),
-                })
-            elif mkind == MSG_SYNC and len(args) >= 8:
-                self.on_game_msg({
-                    "game": gname,
-                    "type": "snake_sync",
-                    "h1": args[2],
-                    "h2": args[3],
-                    "food": args[4],
-                    "l1": args[5],
-                    "l2": args[6],
-                    "res": args[7],
-                })
+        # OP_GAME_MSG over BLE is no longer used: game traffic goes over UDP (see _handle_udp).
 
     def _handle_udp(self, ev: dict):
         try:

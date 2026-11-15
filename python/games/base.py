@@ -11,6 +11,9 @@ same game can be driven by the knob, buttons or a test.
 """
 
 
+import threading
+
+
 class GameIO:
     def __init__(self, send, show, draw=None):
         self.send = send
@@ -47,6 +50,11 @@ class Game:
             return
         if notify_peer and self.role != "local":
             self.io.send({"game": self.name, "type": "quit"})
+            # Repeat once or twice: a lost quit leaves the peer stuck in a dead game
+            for delay in (0.3, 0.7):
+                t = threading.Timer(delay, self.io.send, args=({"game": self.name, "type": "quit"},))
+                t.daemon = True
+                t.start()
         self._finish("quit")
 
     # ---- helpers for subclasses -----------------------------------------

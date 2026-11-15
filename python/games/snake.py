@@ -57,6 +57,9 @@ class Snake(Game):
 
         self._queued_dir = self.my_dir
         self._opp_queued_dir = self.opp_dir
+        self._last_n = -1
+        self._tick_n = 0
+        self._last_pkt = None
         self.food = (6, 3)
 
     def start(self):
@@ -73,18 +76,31 @@ class Snake(Game):
         if self.over:
             return
         with self._lock:
+            # Turn relative to the latest queued heading so quick double turns work
+            base = self._queued_dir
             if action == "next":
-                nd = (self.my_dir + 1) % 4
+                nd = (base + 1) % 4
             elif action == "prev":
-                nd = (self.my_dir - 1) % 4
+                nd = (base - 1) % 4
             else:
                 return
-            # Prevent 180-degree instant self-reversal
+            # Prevent 180-degree instant self-reversal (vs the heading actually moving)
             if (nd + 2) % 4 != self.my_dir:
                 self._queued_dir = nd
 
         if self.role == "guest":
-            self.io.send({"game": self.name, "type": "snake_turn", "dir": self._queued_dir})
+            d = self._queued_dir
+            self.io.send({"game": self.name, "type": "snake_turn", "dir": d})
+            # A lost turn means the snake ignores the player: repeat it while still current
+            for delay in (0.08, 0.2):
+                t = threading.Timer(delay, self._resend_turn, args=(d,))
+                t.daemon = True
+                t.start()
+
+    def _resend_turn(self, d: int):
+        if self.over or self._queued_dir != d:
+            return
+        self.io.send({"game": self.name, "type": "snake_turn", "dir": d})
 
     def handle_remote(self, msg: dict):
         if self.over or self.role == "local":
@@ -101,6 +117,12 @@ class Snake(Game):
                 if (nd + 2) % 4 != self.opp_dir:
                     self._opp_queued_dir = nd
             elif self.role == "guest" and kind == "snake_sync":
+                # Drop stale/reordered ticks ("n" = host tick counter; absent on the BLE path)
+                n = msg.get("n")
+                if n is not None:
+                    if n <= self._last_n:
+                        return
+                    self._last_n = n
                 # Host h1 = host head, h2 = guest head
                 h1 = int(msg.get("h1", 0))
                 h2 = int(msg.get("h2", 0))
@@ -114,6 +136,14 @@ class Snake(Game):
                 if 0 <= h2 < W * H:
                     nh = (h2 % W, h2 // W)
                     if not self.my_body or self.my_body[0] != nh:
+                        if self.my_body:
+                            # Derive real heading from the host-authoritative head move (torus wrap)
+                            ox, oy = self.my_body[0]
+                            for d in range(4):
+                                if (ox + DX[d]) % W == nh[0] and (oy + DY[d]) % H == nh[1]:
+                                    self.my_dir = d
+                                    self._queued_dir = d
+                                    break
                         self.my_body.insert(0, nh)
                     while len(self.my_body) > l2:
                         self.my_body.pop()
@@ -219,9 +249,11 @@ class Snake(Game):
                     h1_idx = self.my_body[0][1] * W + self.my_body[0][0]
                     h2_idx = self.opp_body[0][1] * W + self.opp_body[0][0]
                     f_idx = self.food[1] * W + self.food[0]
+                    self._tick_n += 1
                     pkt = {
                         "game": self.name,
                         "type": "snake_sync",
+                        "n": self._tick_n,
                         "h1": h1_idx,
                         "h2": h2_idx,
                         "food": f_idx,
@@ -233,8 +265,15 @@ class Snake(Game):
                     pkt = None
 
             if pkt is not None:
+                self._last_pkt = pkt
                 self.io.send(pkt)
             self.render()
+
+        # Game over: the final tick carries the result, so repeat it (lossy link)
+        if self.role == "host" and self.over and self._last_pkt and self._last_pkt.get("res"):
+            for _ in range(4):
+                time.sleep(0.25)
+                self.io.send(self._last_pkt)
 
     def snapshot(self) -> str:
         grid = ["."] * (W * H)

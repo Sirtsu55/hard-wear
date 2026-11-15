@@ -252,6 +252,15 @@ def _on_peer_declined(peer_id: int, peer_name: str):
 
 def _on_ble_start_match(peer_id: int, peer_name: str, game_name: str, role: str):
     global using_demo_bot
+    with game_lock:
+        # Repeated START_MATCH packets for a match already running must not restart it.
+        if (
+            active_game is not None
+            and not active_game.over
+            and active_game_name == game_name
+            and ble._active_peer_id == peer_id
+        ):
+            return
     _reset_challenge_state()
     using_demo_bot = False
     ble.busy = True

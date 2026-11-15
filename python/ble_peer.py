@@ -170,7 +170,15 @@ class BlePeerManager:
         self._active_peer_id = peer_id
         gcode = GAME_CODES.get(game_name, 2)
         print(f"[ble] host starting {game_name} with 0x{peer_id:04X}", flush=True)
-        self._send_adv(peer_id, OP_START_MATCH, [gcode], revert_after=3.0)
+        # BLE advertisements are lossy: send START_MATCH several times so the guest's scanner catches one.
+        threading.Thread(target=self._burst_start_match, args=(peer_id, gcode), daemon=True).start()
+
+    def _burst_start_match(self, peer_id: int, gcode: int, repeats: int = 4, gap: float = 0.6):
+        for i in range(repeats):
+            last = i == repeats - 1
+            self._send_adv(peer_id, OP_START_MATCH, [gcode], revert_after=3.0 if last else 0)
+            if not last:
+                time.sleep(gap)
 
     def send_game_dict(self, msg: dict):
         if not self._active_peer_id:

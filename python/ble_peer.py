@@ -90,6 +90,40 @@ class BlePeerManager:
         self._revert_timer = None
         self._running = True
 
+        # Wi-Fi/UDP game link (relayed through the host daemon, which owns the UDP port)
+        self.local_ip = os.environ.get("HOST_IP", "0.0.0.0")
+        self._peer_ips = {}        # peer_id -> "a.b.c.d" (learned from BLE beacons/votes/UDP)
+        self._udp_last_rx = {}     # peer_id -> last time a UDP datagram arrived from it
+        self._start_acked = False
+
+    @staticmethod
+    def _ip_to_bytes(ip: str) -> list[int]:
+        try:
+            parts = [int(x) & 0xFF for x in ip.split(".")]
+            return parts if len(parts) == 4 else [0, 0, 0, 0]
+        except Exception:
+            return [0, 0, 0, 0]
+
+    @staticmethod
+    def _bytes_to_ip(b) -> str:
+        return ".".join(str(int(x)) for x in b[:4]) if len(b) >= 4 else ""
+
+    def _remember_ip(self, peer_id: int, ip: str):
+        if ip and ip != "0.0.0.0":
+            with self._lock:
+                self._peer_ips[peer_id] = ip
+
+    def _udp_send(self, peer_id: int, obj: dict) -> bool:
+        with self._lock:
+            ip = self._peer_ips.get(peer_id)
+        if not ip or not self._sock:
+            return False
+        self._write_daemon({"cmd": "udp", "ip": ip, "data": json.dumps(obj, separators=(",", ":"))})
+        return True
+
+    def _udp_alive(self, peer_id: int, within: float = 4.0) -> bool:
+        return time.time() - self._udp_last_rx.get(peer_id, 0.0) <= within
+
     def start(self):
         threading.Thread(target=self._conn_loop, daemon=True).start()
         threading.Thread(target=self._prune_loop, daemon=True).start()
@@ -138,6 +172,8 @@ class BlePeerManager:
             opcode & 0xFF,
         ] + [int(x) & 0xFF for x in list(args)[:12]])
 
+        if opcode != OP_BEACON:
+            print(f"[ble] tx op=0x{opcode:02X} to 0x{dst_id:04X} seq={seq} args={list(args)}", flush=True)
         self._write_daemon({"cmd": "adv", "hex": pkt.hex()})
 
         if self._revert_timer is not None:
@@ -153,13 +189,14 @@ class BlePeerManager:
     def advertise_idle(self):
         if self.node_id == 0:
             return
-        self._send_adv(0x0000, OP_BEACON, [], revert_after=0)
+        # Beacon args carry our Wi-Fi IP so peers can open the UDP game link.
+        self._send_adv(0x0000, OP_BEACON, self._ip_to_bytes(self.local_ip), revert_after=0)
 
     def vote_yes(self, peer_id: int, preferred_game: str = ""):
         self._active_peer_id = peer_id
         gcode = GAME_CODES.get(preferred_game, 0)
         print(f"[ble] voted YES for challenge with 0x{peer_id:04X} (game={gcode})", flush=True)
-        self._send_adv(peer_id, OP_READY_YES, [gcode], revert_after=12.0)
+        self._send_adv(peer_id, OP_READY_YES, [gcode] + self._ip_to_bytes(self.local_ip), revert_after=12.0)
 
     def vote_no(self, peer_id: int):
         self.set_cooldown(peer_id, AUTO_CHALLENGE_COOLDOWN)
@@ -171,14 +208,31 @@ class BlePeerManager:
         gcode = GAME_CODES.get(game_name, 2)
         print(f"[ble] host starting {game_name} with 0x{peer_id:04X}", flush=True)
         # BLE advertisements are lossy: send START_MATCH several times so the guest's scanner catches one.
+        self._start_acked = False
+        threading.Thread(target=self._udp_start_loop, args=(peer_id, game_name), daemon=True).start()
         threading.Thread(target=self._burst_start_match, args=(peer_id, gcode), daemon=True).start()
+
+    def _udp_start_loop(self, peer_id: int, game_name: str):
+        """Reliable start over Wi-Fi: re-send until the guest acknowledges."""
+        for _ in range(15):
+            if self._start_acked or self._active_peer_id != peer_id:
+                return
+            self._udp_send(peer_id, {"t": "start", "from": self.node_id, "game": game_name})
+            time.sleep(0.3)
 
     def _burst_start_match(self, peer_id: int, gcode: int, repeats: int = 4, gap: float = 0.6):
         for i in range(repeats):
+            if self._start_acked:
+                break
             last = i == repeats - 1
-            self._send_adv(peer_id, OP_START_MATCH, [gcode], revert_after=3.0 if last else 0)
+            self._send_adv(
+                peer_id, OP_START_MATCH, [gcode] + self._ip_to_bytes(self.local_ip),
+                revert_after=3.0 if last else 0,
+            )
             if not last:
                 time.sleep(gap)
+        if self._start_acked:
+            self.advertise_idle()
 
     def send_game_dict(self, msg: dict):
         if not self._active_peer_id:
@@ -186,6 +240,12 @@ class BlePeerManager:
         game_name = msg.get("game", "pong")
         gcode = GAME_CODES.get(game_name, 2)
         mtype = msg.get("type", "")
+
+        # Preferred path: Wi-Fi UDP (full-fidelity dict, low latency). Fall back to BLE only
+        # while no UDP traffic has been seen from the peer.
+        if self._udp_send(self._active_peer_id, {"t": "g", "from": self.node_id, "msg": msg}):
+            if self._udp_alive(self._active_peer_id):
+                return
 
         if mtype == "quit":
             self._send_adv(self._active_peer_id, OP_GAME_MSG, [gcode, MSG_QUIT], revert_after=2.0)
@@ -284,8 +344,18 @@ class BlePeerManager:
         if kind == "hello":
             self.node_id = int(ev.get("node_id", 0))
             self.badge_name = ev.get("name", "HW-????")
-            print(f"[ble] connected to host radio as {self.badge_name} (0x{self.node_id:04X})", flush=True)
+            ip = ev.get("ip", "")
+            if ip and ip != "0.0.0.0":
+                self.local_ip = ip
+            print(
+                f"[ble] connected to host radio as {self.badge_name} (0x{self.node_id:04X}) ip={self.local_ip}",
+                flush=True,
+            )
             self.advertise_idle()
+            return
+
+        if kind == "udp":
+            self._handle_udp(ev)
             return
 
         if kind != "rx":
@@ -354,6 +424,17 @@ class BlePeerManager:
         if should_auto_challenge:
             self.on_auto_challenge(src_id, peer_name)
 
+        if opcode == OP_BEACON:
+            self._remember_ip(src_id, self._bytes_to_ip(args))
+        elif opcode in (OP_READY_YES, OP_INVITE, OP_ACCEPT, OP_START_MATCH):
+            self._remember_ip(src_id, self._bytes_to_ip(args[1:]))
+
+        if opcode != OP_BEACON:
+            print(
+                f"[ble] rx op=0x{opcode:02X} from 0x{src_id:04X} to 0x{dst_id:04X} "
+                f"seq={seq} args={list(args)} new_seq={is_new_seq} me=0x{self.node_id:04X}",
+                flush=True,
+            )
         if dst_id not in (0x0000, self.node_id):
             return
         if not is_new_seq or opcode == OP_BEACON:
@@ -402,6 +483,31 @@ class BlePeerManager:
                     "l2": args[6],
                     "res": args[7],
                 })
+
+    def _handle_udp(self, ev: dict):
+        try:
+            obj = json.loads(ev.get("data", ""))
+        except Exception:
+            return
+        src = int(obj.get("from", 0))
+        if not src or src == self.node_id:
+            return
+        self._remember_ip(src, ev.get("ip", ""))
+        self._udp_last_rx[src] = time.time()
+        t = obj.get("t")
+
+        if t == "start":
+            gname = obj.get("game", "pong")
+            self._udp_send(src, {"t": "ack", "from": self.node_id})
+            self._active_peer_id = src
+            self.advertise_idle()
+            self.on_start_match(src, f"HW-{src:04X}", gname, "guest")
+        elif t == "ack":
+            self._start_acked = True
+        elif t == "g" and src == self._active_peer_id:
+            msg = obj.get("msg")
+            if isinstance(msg, dict):
+                self.on_game_msg(msg)
 
     def _prune_loop(self):
         last_reported = 0

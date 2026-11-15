@@ -221,11 +221,58 @@ class BluezController:
                 pass
 
 
+UDP_PORT = 47800
+
+
+def get_local_ip() -> str:
+    """Wi-Fi/LAN IPv4 of this host (the UDP connect trick sends no packets)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "0.0.0.0"
+
+
 class BleSocketServer:
     def __init__(self):
         self.clients = set()
         self.clients_lock = threading.Lock()
         self.ble = BluezController(self._on_ble_rx)
+        # UDP game link: the app container sits behind Docker NAT, so the host owns the UDP port
+        # and relays datagrams to/from the app over the unix socket.
+        self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._udp.bind(("0.0.0.0", UDP_PORT))
+        # BLE advertisement rewrites are slow (bluetoothctl); a latest-wins worker keeps them
+        # from blocking UDP relaying.
+        self._adv_pending = None
+        self._adv_event = threading.Event()
+        threading.Thread(target=self._udp_rx_loop, daemon=True).start()
+        threading.Thread(target=self._adv_worker, daemon=True).start()
+
+    def _adv_worker(self):
+        while True:
+            self._adv_event.wait()
+            self._adv_event.clear()
+            raw, self._adv_pending = self._adv_pending, None
+            if raw is not None:
+                self.ble.set_advertisement(raw)
+
+    def _udp_rx_loop(self):
+        while True:
+            try:
+                data, addr = self._udp.recvfrom(2048)
+            except OSError:
+                time.sleep(0.2)
+                continue
+            self._broadcast_json({
+                "event": "udp",
+                "ip": addr[0],
+                "data": data.decode("utf-8", errors="ignore"),
+            })
 
     def _broadcast_json(self, obj: dict):
         line = (json.dumps(obj) + "\n").encode("utf-8")
@@ -263,6 +310,7 @@ class BleSocketServer:
             "event": "hello",
             "node_id": self.ble.node_id,
             "name": self.ble.badge_name,
+            "ip": get_local_ip(),
         }) + "\n"
         try:
             conn.sendall(hello.encode("utf-8"))
@@ -288,8 +336,13 @@ class BleSocketServer:
                     except Exception:
                         continue
                     if cmd.get("cmd") == "adv":
-                        raw = bytes.fromhex(cmd.get("hex", ""))
-                        self.ble.set_advertisement(raw)
+                        self._adv_pending = bytes.fromhex(cmd.get("hex", ""))
+                        self._adv_event.set()
+                    elif cmd.get("cmd") == "udp":
+                        try:
+                            self._udp.sendto(cmd.get("data", "").encode("utf-8"), (cmd["ip"], UDP_PORT))
+                        except Exception:
+                            pass
         except OSError:
             pass
         finally:

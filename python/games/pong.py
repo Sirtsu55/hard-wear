@@ -41,10 +41,11 @@ class Pong(Game):
         self.vy = 1 if random.random() < 0.5 else -1
         self.my_score = 0
         self.opp_score = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._running = False
         self._tick_count = 0
         self._last_n = -1
+        self._rx_count = 0
 
     def start(self):
         self._running = True
@@ -73,6 +74,11 @@ class Pong(Game):
             self.render()
             if self.role == "guest":
                 self.io.send(self._guest_paddle_pkt())
+            elif self.role == "host" and not self.over:
+                # Push our paddle immediately instead of waiting for the next tick
+                with self._lock:
+                    pkt = self._host_pkt()
+                self.io.send(pkt)
 
     def _guest_paddle_pkt(self) -> dict:
         return {
@@ -119,7 +125,7 @@ class Pong(Game):
                 # Drop stale/reordered state (UDP can reorder; "n" is the host tick counter)
                 n = msg.get("n")
                 if n is not None:
-                    if n <= self._last_n:
+                    if n < self._last_n:  # equal n = same tick, newer paddle: still apply
                         return
                     self._last_n = n
                 # Host sent full authoritative state; mirror X so guest sees itself on col 0!
@@ -141,8 +147,11 @@ class Pong(Game):
                     self.result = res
         self.render()
         if self.role == "guest" and not self.over:
-            # Re-announce our paddle with every host state so a lost paddle packet self-heals
-            self.io.send(self._guest_paddle_pkt())
+            # Heartbeat our paddle every 3rd host state so a lost packet self-heals
+            # without echoing a packet for every state (halves link load)
+            self._rx_count += 1
+            if self._rx_count % 3 == 0:
+                self.io.send(self._guest_paddle_pkt())
 
     def _reset_ball(self, serve_dir: int):
         self.bx = 6
@@ -151,8 +160,15 @@ class Pong(Game):
         self.vy = random.choice([-1, 1])
 
     def _loop(self):
+        next_t = time.monotonic() + TICK_SEC
         while self._running and not self.over:
-            time.sleep(TICK_SEC)
+            # Fixed-deadline scheduling: no drift from render/send time
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            next_t += TICK_SEC
+            if next_t < time.monotonic():
+                next_t = time.monotonic() + TICK_SEC
             if not self._running or self.over:
                 break
 
@@ -227,7 +243,7 @@ class Pong(Game):
                     self.bx = nx
                     self.by = ny
 
-                if self.role == "host" and (sync_needed or self._tick_count % 2 == 0 or self.over):
+                if self.role == "host":  # every tick: guest sees every ball step
                     pkt = self._host_pkt()
                 else:
                     pkt = None
@@ -243,6 +259,10 @@ class Pong(Game):
                 self.io.send(self._host_pkt())
 
     def snapshot(self) -> str:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> str:
         if self.over:
             if self.result == "quit":
                 st = "q"

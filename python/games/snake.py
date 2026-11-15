@@ -40,7 +40,7 @@ class Snake(Game):
 
     def __init__(self, io, role: str):
         super().__init__(io, role)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._running = False
 
         # Host/Solo spawns on left heading Right; Rival spawns on right heading Left
@@ -133,6 +133,25 @@ class Snake(Game):
 
                 if 0 <= fpos < W * H:
                     self.food = (fpos % W, fpos // W)
+                b1 = msg.get("b1")
+                b2 = msg.get("b2")
+                if isinstance(b1, list) and isinstance(b2, list) and b1 and b2:
+                    # Full-state sync: every packet is self-contained, so a lost or
+                    # reordered packet can no longer leave gaps in the snake bodies.
+                    # Host b1 = host body, b2 = guest body (head first).
+                    new_me = [(int(i) % W, (int(i) // W) % H) for i in b2]
+                    new_opp = [(int(i) % W, (int(i) // W) % H) for i in b1]
+                    if len(new_me) >= 2:
+                        hx, hy = new_me[0]
+                        px, py = new_me[1]
+                        for d in range(4):
+                            if (px + DX[d]) % W == hx and (py + DY[d]) % H == hy:
+                                self.my_dir = d
+                                self._queued_dir = d
+                                break
+                    self.my_body = new_me
+                    self.opp_body = new_opp
+                    h1 = h2 = -1
                 if 0 <= h2 < W * H:
                     nh = (h2 % W, h2 // W)
                     if not self.my_body or self.my_body[0] != nh:
@@ -192,8 +211,15 @@ class Snake(Game):
             self.food = random.choice(free)
 
     def _loop(self):
+        next_t = time.monotonic() + TICK_SEC
         while self._running and not self.over:
-            time.sleep(TICK_SEC)
+            # Fixed-deadline scheduling: no drift from render/send time
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            next_t += TICK_SEC
+            if next_t < time.monotonic():
+                next_t = time.monotonic() + TICK_SEC
             if not self._running or self.over:
                 break
 
@@ -259,6 +285,8 @@ class Snake(Game):
                         "food": f_idx,
                         "l1": len(self.my_body),
                         "l2": len(self.opp_body),
+                        "b1": [y * W + x for x, y in self.my_body],
+                        "b2": [y * W + x for x, y in self.opp_body],
                         "res": res_code,
                     }
                 else:
@@ -276,6 +304,10 @@ class Snake(Game):
                 self.io.send(self._last_pkt)
 
     def snapshot(self) -> str:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> str:
         grid = ["."] * (W * H)
         fx, fy = self.food
         if 0 <= fx < W and 0 <= fy < H:

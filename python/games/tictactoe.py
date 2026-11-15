@@ -37,6 +37,10 @@ class TicTacToe(Game):
         self.turn = "X"       # X always starts
         self.cursor = 4       # centre cell by default
         self.winner = None
+        self._lock = threading.RLock()
+        self._running = False
+        self._sent_n = 0   # move count of my latest move
+        self._peer_n = 0   # highest move count the peer has reported seeing
 
     @property
     def local(self) -> bool:
@@ -56,43 +60,102 @@ class TicTacToe(Game):
             if not self._my_turn():
                 self.io.show("Wait for the other player")
                 return
-            mark = self.turn if self.local else self.mine
-            if not self._place(self.cursor, mark):
-                self.io.show("Cell taken")
-                return
-            if not self.local:
-                self._send_move(self.cursor, sum(1 for c in self.board if c))
-            self._after_move()
+            with self._lock:
+                mark = self.turn if self.local else self.mine
+                if not self._place(self.cursor, mark):
+                    self.io.show("Cell taken")
+                    return
+                self._after_move_locked_send()
+
+    def _after_move_locked_send(self):
+        self._after_move()
+        if not self.local:
+            self._send_move(self.cursor, self._count())
 
     def handle_remote(self, msg: dict):
         if self.over or self.local:
             return
         kind = msg.get("type")
         if kind == "quit":
+            self._running = False
             self._finish("quit")
             return
-        if kind != "move":
+        if kind != "state":
             return
-        cell = msg.get("cell")
-        if not isinstance(cell, int) or not 0 <= cell < 9:
+        b = msg.get("b")
+        n = msg.get("n")
+        if not isinstance(b, str) or len(b) != 9 or not isinstance(n, int):
             return
-        n = msg.get("n")  # move number (marks on board after the move); dedupes resends
-        if n is not None and n != sum(1 for c in self.board if c):
-            return
-        if self.turn != self.theirs or not self._place(cell, self.theirs):
-            return  # out-of-turn or illegal move: ignore
-        self._after_move()
+        with self._lock:
+            self._peer_n = max(self._peer_n, n)
+            if n <= self._count():
+                return  # nothing new (duplicate / heartbeat / stale)
+            new = ["" if ch == "." else ch for ch in b]
+            if any(o and o != nb for o, nb in zip(self.board, new)):
+                return  # inconsistent with our marks: ignore
+            if sum(1 for c in new if c) != n:
+                return
+            self.board = new
+            # X moves on even counts, O on odd
+            self.turn = "X" if n % 2 == 0 else "O"
+            w = self._winner()
+            if w:
+                self.winner = w
+                self.over = True
+                self.result = "win" if w == self.mine else "lose"
+            elif all(self.board):
+                self.over = True
+                self.result = "draw"
+        self.render()
+
+    # ---- state sync ------------------------------------------------------
+    # Every message carries the FULL board and its move count, so any single packet
+    # that arrives brings the peer fully up to date (idempotent, order-independent).
+    # Unacknowledged moves are re-sent every 0.2s; a 1s heartbeat heals anything else.
+    def _count(self) -> int:
+        return sum(1 for c in self.board if c)
+
+    def _state_pkt(self) -> dict:
+        return {
+            "game": self.name, "type": "state",
+            "b": "".join(c or "." for c in self.board), "n": self._count(),
+        }
 
     def _send_move(self, cell: int, n: int):
-        """Moves are one-shot messages on a lossy link: send now and repeat a few times.
-        The receiver ignores duplicates via the move number."""
-        self.io.send({"game": self.name, "type": "move", "cell": cell, "n": n})
-        for i in range(1, 5):
-            t = threading.Timer(0.35 * i, self.io.send, args=({
-                "game": self.name, "type": "move", "cell": cell, "n": n, "dup": True,
-            },))
-            t.daemon = True
-            t.start()
+        self._sent_n = n
+        self.io.send(self._state_pkt())
+
+    def start(self):
+        super().start()
+        if not self.local:
+            self._running = True
+            threading.Thread(target=self._sync_loop, daemon=True).start()
+
+    def _sync_loop(self):
+        import time
+        last = 0.0
+        end_deadline = None
+        while self._running:
+            time.sleep(0.1)
+            now = time.monotonic()
+            with self._lock:
+                unacked = self._sent_n > self._peer_n
+                over = self.over
+                pkt = self._state_pkt()
+            if over:
+                if end_deadline is None:
+                    end_deadline = now + 5.0
+                if not unacked or now > end_deadline:
+                    if self.result == "quit" or now > end_deadline or not unacked:
+                        break
+            if now - last >= (0.2 if unacked else 1.0):
+                last = now
+                self.io.send(pkt)
+        self._running = False
+
+    def quit(self, notify_peer: bool = True):
+        super().quit(notify_peer=notify_peer)
+        # keep the sync thread alive after a loss/win so the final move still gets through
 
     # ---- rules -----------------------------------------------------------
     def _my_turn(self) -> bool:

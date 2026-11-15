@@ -155,6 +155,15 @@ def _demo_bot_reply(msg: dict):
                 route_message(active_game, {"game": "tictactoe", "type": "move", "cell": pick})
 
 
+def _host_begin(gname: str):
+    """Host starts its own game only once the guest acked (or the ack timed out)."""
+    Bridge.notify("ble_start_game", gname)
+    with game_lock:
+        if active_game is not None and not active_game.over:
+            active_game.quit(notify_peer=False)
+        _start(gname, "host")
+
+
 def _show_game_picker(is_ble_host: bool):
     global game_pick_idx
     gname = GAME_ORDER[game_pick_idx % len(GAME_ORDER)]
@@ -168,6 +177,8 @@ def _check_mutual_ready():
     global ble_host_picking, game_pick_idx
     if not (i_voted_yes and peer_voted_yes and challenge_peer_id):
         return
+    if ble_host_picking:
+        return  # duplicate vote (same vote arrives over BLE and UDP): don't reset the picker
 
     pid = challenge_peer_id
     pname = challenge_peer_name
@@ -312,8 +323,9 @@ def on_picker_ui(action: str):
                 role = "local" if gname in ("pong", "snake") else "host"
             else:
                 using_demo_bot = False
-                role = "host"
-                ble.broadcast_start_match(pid, gname)
+                Bridge.notify("show_status", "STARTING...", "Syncing with peer"[:40])
+                ble.broadcast_start_match(pid, gname, on_ready=lambda g=gname: _host_begin(g))
+                return
             Bridge.notify("ble_start_game", gname)
             with game_lock:
                 if active_game is not None and not active_game.over:
@@ -449,8 +461,10 @@ def on_game_local(action: str):
                 if active_game_role == "local":
                     _start(active_game_name, "local")
                 elif active_game_role == "host" and ble._active_peer_id:
-                    ble.broadcast_start_match(ble._active_peer_id, active_game_name)
-                    _start(active_game_name, "host")
+                    gname = active_game_name
+                    ble.broadcast_start_match(
+                        ble._active_peer_id, gname, on_ready=lambda g=gname: _host_begin(g)
+                    )
             return
         active_game.handle_local(action)
 

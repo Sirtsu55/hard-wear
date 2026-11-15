@@ -95,6 +95,7 @@ class BlePeerManager:
         self._peer_ips = {}        # peer_id -> "a.b.c.d" (learned from BLE beacons/votes/UDP)
         self._udp_last_rx = {}     # peer_id -> last time a UDP datagram arrived from it
         self._start_acked = False
+        self._start_pending = False
 
     @staticmethod
     def _ip_to_bytes(ip: str) -> list[int]:
@@ -196,29 +197,47 @@ class BlePeerManager:
         self._active_peer_id = peer_id
         gcode = GAME_CODES.get(preferred_game, 0)
         print(f"[ble] voted YES for challenge with 0x{peer_id:04X} (game={gcode})", flush=True)
+        self._udp_send(peer_id, {"t": "vote", "from": self.node_id, "gcode": gcode})
         self._send_adv(peer_id, OP_READY_YES, [gcode] + self._ip_to_bytes(self.local_ip), revert_after=12.0)
 
     def vote_no(self, peer_id: int):
         self.set_cooldown(peer_id, AUTO_CHALLENGE_COOLDOWN)
         print(f"[ble] voted NO for challenge with 0x{peer_id:04X}", flush=True)
+        self._udp_send(peer_id, {"t": "decline", "from": self.node_id})
         self._send_adv(peer_id, OP_DECLINE, [0], revert_after=2.5)
 
-    def broadcast_start_match(self, peer_id: int, game_name: str):
+    def broadcast_start_match(self, peer_id: int, game_name: str, on_ready=None):
+        """Tell the guest to start. `on_ready` (host-side begin) fires once the guest has
+        acknowledged over Wi-Fi, so both boards start together; without a known peer IP or
+        an ack within ~4s it fires anyway (legacy BLE behaviour)."""
+        if self._start_pending:
+            return
+        self._start_pending = True
         self._active_peer_id = peer_id
         gcode = GAME_CODES.get(game_name, 2)
         print(f"[ble] host starting {game_name} with 0x{peer_id:04X}", flush=True)
-        # BLE advertisements are lossy: send START_MATCH several times so the guest's scanner catches one.
         self._start_acked = False
-        threading.Thread(target=self._udp_start_loop, args=(peer_id, game_name), daemon=True).start()
+        threading.Thread(target=self._udp_start_loop, args=(peer_id, game_name, on_ready), daemon=True).start()
         threading.Thread(target=self._burst_start_match, args=(peer_id, gcode), daemon=True).start()
 
-    def _udp_start_loop(self, peer_id: int, game_name: str):
-        """Reliable start over Wi-Fi: re-send until the guest acknowledges."""
-        for _ in range(15):
-            if self._start_acked or self._active_peer_id != peer_id:
-                return
-            self._udp_send(peer_id, {"t": "start", "from": self.node_id, "game": game_name})
-            time.sleep(0.3)
+    def _udp_start_loop(self, peer_id: int, game_name: str, on_ready=None):
+        """Reliable start over Wi-Fi: re-send every 0.3s until the guest acknowledges."""
+        try:
+            with self._lock:
+                have_ip = peer_id in self._peer_ips
+            if have_ip:
+                deadline = time.time() + 4.5
+                next_send = 0.0
+                while time.time() < deadline and not self._start_acked and self._active_peer_id == peer_id:
+                    if time.time() >= next_send:
+                        self._udp_send(peer_id, {"t": "start", "from": self.node_id, "game": game_name})
+                        next_send = time.time() + 0.3
+                    time.sleep(0.02)
+                print(f"[ble] start ack={'yes' if self._start_acked else 'NO (timeout)'}", flush=True)
+        finally:
+            self._start_pending = False
+            if on_ready:
+                on_ready()
 
     def _burst_start_match(self, peer_id: int, gcode: int, repeats: int = 4, gap: float = 0.6):
         for i in range(repeats):
@@ -504,6 +523,11 @@ class BlePeerManager:
             self.on_start_match(src, f"HW-{src:04X}", gname, "guest")
         elif t == "ack":
             self._start_acked = True
+        elif t == "vote":
+            self.on_peer_voted_yes(src, f"HW-{src:04X}", int(obj.get("gcode", 0)))
+        elif t == "decline":
+            self.set_cooldown(src, AUTO_CHALLENGE_COOLDOWN)
+            self.on_peer_declined(src, f"HW-{src:04X}")
         elif t == "g" and src == self._active_peer_id:
             msg = obj.get("msg")
             if isinstance(msg, dict):

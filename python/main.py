@@ -2,21 +2,13 @@ import random
 import threading
 import time
 
-from arduino.app_bricks.cloud_llm import CloudLLM  # keeps arduino:cloud_llm brick & API_KEY wired
 from arduino.app_utils import App, Bridge
 
 from ble_peer import CODE_TO_GAME, GAME_ORDER, GAME_TITLES, BlePeerManager
 from games import GameIO, create_game, route_message
-from gemini_audio import GeminiAudioAssistant
+from arduino.app_bricks.llm import LargeLanguageModel  # noqa: F401  keeps arduino:llm brick wired
+from local_ai import Cancelled, LocalLLM, LocalSTT, clean_for_oled
 from recorder import WavRecorder
-
-SYSTEM_PROMPT = (
-    "You are Hard Wear, a witty fashion wearable buddy clipped to a traveler's bag or belt. "
-    "Answer concisely in 1 to 2 short sentences (under 32 words), friendly and helpful, "
-    "using plain printable ASCII only (no emojis or markdown)."
-)
-
-assistant = GeminiAudioAssistant(system_prompt=SYSTEM_PROMPT, max_turns=6)
 
 DEMO_PROMPTS = [
     "Say a fun travel icebreaker to someone standing next to me, and give me one quick travel tip.",
@@ -62,22 +54,56 @@ def send_to_device(req_id: int, text: str):
     Bridge.notify("show_reply", req_id, text)
 
 
-def handle_text_ask(req_id: int):
-    try:
-        reply = assistant.ask_text(get_demo_prompt())
-    except Exception as e:
-        reply = str(e)
-    send_to_device(req_id, reply)
+# ---- Local AI (offline STT + LLM) ----
+LOCAL_SYSTEM_PROMPT = (
+    "You are Hard Wear, a friendly wearable buddy. Reply in 1-2 short sentences, "
+    "under 25 words, plain ASCII, no emojis or markdown."
+)
+local_stt = LocalSTT()
+local_llm = LocalLLM(LOCAL_SYSTEM_PROMPT)
 
 
-def handle_audio_ask(req_id: int, wav_path: str):
+def progress(req_id: int, title: str, body: str):
+    """Short OLED progress state; skipped once the request was cancelled."""
+    if not is_cancelled(req_id):
+        Bridge.notify("show_status", title[:20], body[:60])
+
+
+def run_local(req_id: int, wav_path, text_prompt) -> str:
+    if wav_path:
+        progress(req_id, "Transcribing...", "(2xClick: Cancel)")
+        heard = local_stt.transcribe(wav_path)
+        if is_cancelled(req_id):
+            raise Cancelled()
+        if not heard.strip():
+            return "I didn't catch that. Hold the knob and speak a bit closer."
+        print(f"[ai] heard: {heard}", flush=True)
+        prompt = heard
+    else:
+        prompt = text_prompt
+    progress(req_id, "EdgeAI Thinking...", "(2xClick: Cancel)")
+    return local_llm.ask(prompt, lambda: is_cancelled(req_id))
+
+
+def handle_ai(req_id: int, wav_path, text_prompt):
     if is_cancelled(req_id):
         return
     try:
-        reply = assistant.ask_audio(wav_path)
+        reply = run_local(req_id, wav_path, text_prompt)
+    except Cancelled:
+        print(f"[ai] local run cancelled req_id={req_id}", flush=True)
+        return
     except Exception as e:
-        reply = str(e)
+        reply = clean_for_oled(f"AI error: {e}")[:100]
     send_to_device(req_id, reply)
+
+
+def handle_text_ask(req_id: int):
+    handle_ai(req_id, None, get_demo_prompt())
+
+
+def handle_audio_ask(req_id: int, wav_path: str):
+    handle_ai(req_id, wav_path, None)
 
 
 def on_ask_request(req_id: int):
@@ -472,7 +498,7 @@ def on_game_local(action: str):
 Bridge.provide("game_input", on_game_local)
 
 
-# ---- Mic Recording & Hold-to-Talk Gemini evaluation ----
+# ---- Mic Recording & Hold-to-Talk local AI ----
 recorder = WavRecorder()
 
 
@@ -495,10 +521,10 @@ def on_audio_end(total_samples: int) -> bool:
 def on_audio_ask_end(total_samples: int, req_id: int) -> bool:
     path = recorder.finish(total_samples)
     if is_cancelled(req_id):
-        print(f"[mic] cancelled before Gemini call (req_id={req_id})", flush=True)
+        print(f"[mic] cancelled before local AI (req_id={req_id})", flush=True)
         return True
     secs = total_samples / 8000.0
-    print(f"[mic -> gemini #{req_id}] saved {path} ({secs:.2f}s, {total_samples} samples)", flush=True)
+    print(f"[mic -> ai #{req_id}] saved {path} ({secs:.2f}s, {total_samples} samples)", flush=True)
     threading.Thread(target=handle_audio_ask, args=(req_id, path), daemon=True).start()
     return True
 

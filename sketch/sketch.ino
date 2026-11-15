@@ -345,7 +345,7 @@ int pickerIdx = 0;
 
 const int MENU_COUNT = 4;
 const char* const MENU_ITEMS[MENU_COUNT] = {
-  "Ask AI Buddy",
+  "Ask EdgeAI",
   "Mini Games",
   "BLE Peers (0)",
   "Mic Waveform"
@@ -1060,7 +1060,7 @@ void runHoldToTalkCapture() {
   activeAiReqId = ++aiReqId;
   startMatrix();
   renderAiThinkingMatrix(millis());
-  oledSetScrollText("SENDING VOICE...", "Uploading clip... (2xClick: Cancel)");
+  oledSetScrollText("Processing recording...", "(2xClick: Cancel)");
   oledRenderScrollView();
 
   recordedSamples = total;
@@ -1080,7 +1080,7 @@ void stepAudioStream() {
     streamingAudio = false;
     bool ok = false;
     if (streamForAi) {
-      oledSetScrollText("GEMINI THINKING", "Evaluating voice... (2xClick: Cancel)");
+      oledSetScrollText("Transcribing...", "(2xClick: Cancel)");
       oledRenderScrollView();
       Bridge.call("audio_ask_end", recordedSamples, activeAiReqId).result(ok);
     } else {
@@ -1252,7 +1252,7 @@ void enterSelectedMode(int sel) {
       mode = AI_BUDDY;
       startMatrix();
       drawMenuMatrixIcon(0);
-      oledSetScrollText("AI BUDDY", "Hold knob to talk! (Or click for quick prompt. 2xClick: Menu)");
+      oledSetScrollText("EDGE AI", "Hold knob to talk! (Or click for quick prompt. 2xClick: Menu)");
       oledRenderScrollView();
       break;
     case 1:  // Mini Games (Solo Game Picker: Pong, Snake, Tic-Tac-Toe)
@@ -1330,7 +1330,7 @@ void onShortPress() {
       aiThinking = true;
       activeAiReqId = ++aiReqId;
       renderAiThinkingMatrix(millis());
-      oledSetScrollText("AI THINKING...", "Asking AI Buddy... (2xClick: Cancel)");
+      oledSetScrollText("EdgeAI Thinking...", "(2xClick: Cancel)");
       oledRenderScrollView();
       Bridge.notify("ask_request", activeAiReqId);
     }
@@ -1456,7 +1456,7 @@ void loop() {
       lastActivityMs = modeEnterMs;
       startMatrix();
       drawMenuMatrixIcon(0);
-      oledSetScrollText("AI BUDDY", reply.c_str());
+      oledSetScrollText("EDGE AI", reply.c_str());
       oledRenderScrollView();
       sfxReplyReady();
       now = millis();
@@ -1547,6 +1547,7 @@ void loop() {
   stepSfx(now);
 
   int8_t d = knob.getDirection();
+  d = -d;  // knob is mounted reversed: swap turn direction in software
   if (d != 0) {
     if (clickPending) {
       clickPending = false;

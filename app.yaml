@@ -1,0 +1,8 @@
+name: Hard Wear
+description: ""
+ports: []
+bricks:
+- arduino:cloud_llm:
+    variables:
+      API_KEY: AQ.Ab8RN6I88x4uFz5QvLtd6v6CFN6IWBuUDiDYiRzv1pEs-2eYsw
+icon: 😀

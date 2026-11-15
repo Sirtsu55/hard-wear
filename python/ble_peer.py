@@ -25,7 +25,7 @@ import socket
 import threading
 import time
 
-SOCK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".ble.sock")
+SOCK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "ble.sock")
 
 OP_BEACON = 0x01
 OP_INVITE = 0x02
@@ -233,8 +233,16 @@ class BlePeerManager:
             pass
 
     def _conn_loop(self):
+        last_warn = 0.0
         while self._running:
             if not os.path.exists(SOCK_PATH):
+                if time.time() - last_warn > 15.0:
+                    last_warn = time.time()
+                    print(
+                        "[ble] WARNING: host BLE daemon is not running (no socket) - "
+                        "badges cannot discover each other. Run python/setup_ble_autostart.sh on the board.",
+                        flush=True,
+                    )
                 time.sleep(1.2)
                 continue
             try:

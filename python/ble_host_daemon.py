@@ -27,7 +27,8 @@ import threading
 import time
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOCK_PATH = os.path.join(APP_DIR, ".ble.sock")
+# Lives in .cache/ (not synced by App Lab; a socket in the app root breaks checkout/sync)
+SOCK_PATH = os.path.join(APP_DIR, ".cache", "ble.sock")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\r")
 CTRL_MAC_RE = re.compile(r"Controller\s+([0-9A-F:]{17})", re.I)
@@ -177,11 +178,15 @@ class BluezController:
             self._awaiting_mfg_hex = False
 
             if rest.startswith("RSSI:"):
-                try:
-                    val = int(rest.split()[1])
-                    self._dev_rssi[mac] = val
-                except Exception:
-                    pass
+                # bluetoothctl prints e.g. "RSSI: 0xffffffbe (-66)"; the decimal is in parentheses
+                rm = re.search(r"\((-?\d+)\)", rest)
+                if rm:
+                    self._dev_rssi[mac] = int(rm.group(1))
+                else:
+                    try:
+                        self._dev_rssi[mac] = int(rest.split()[1])
+                    except Exception:
+                        pass
             elif rest.startswith("Name:") or rest.startswith("Alias:"):
                 self._dev_names[mac] = rest.split(":", 1)[1].strip()
             elif "ManufacturerData.Value:" in rest or "ManufacturerData Value:" in rest:
@@ -297,7 +302,7 @@ class BleSocketServer:
 
     def serve_forever(self):
         self.ble.start()
-        os.makedirs(APP_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(SOCK_PATH), exist_ok=True)
         try:
             os.unlink(SOCK_PATH)
         except FileNotFoundError:

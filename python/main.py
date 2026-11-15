@@ -168,7 +168,7 @@ def _start(name: str, role: str):
 
 def _demo_bot_reply(msg: dict):
     """Simulated peer for 1-board testing of Tic-Tac-Toe."""
-    if msg.get("type") != "move":
+    if msg.get("type") != "move" or msg.get("dup"):
         return
     time.sleep(0.5)
     with game_lock:
